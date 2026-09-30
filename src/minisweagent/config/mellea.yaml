@@ -31,6 +31,14 @@ agent:
     </system_information>
   step_limit: 50
   cost_limit: 3.
+  # Each requirement is judged by the LM for every decision (one extra call each). Empty = structure only.
+  requirements: []
+  # requirements:
+  #   - The decision must make progress toward the user's task.
+  #   - Do not repeat an action when the history already shows that it failed without making a relevant change in approach.
+  #   - Finish only when the requested change has been implemented and reasonably verified from the available evidence.
+  # Generation attempts per decision; failed attempts are repaired with the unmet requirements.
+  loop_budget: 1
   observation_template: |
     {% if output.exception_info -%}
     <exception>{{output.exception_info}}</exception>

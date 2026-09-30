@@ -6,9 +6,9 @@ import yaml
 
 pytest.importorskip("mellea")
 
-from mellea import MelleaSession  # noqa: E402
 from mellea.backends.dummy import DummyBackend  # noqa: E402
 from mellea.core import GenerateLog, ModelOutputThunk  # noqa: E402
+from mellea.stdlib.components.genstub import GenerativeStub  # noqa: E402
 
 from minisweagent.agents import get_agent  # noqa: E402
 from minisweagent.agents.mellea import MelleaAgent  # noqa: E402
@@ -17,14 +17,19 @@ from minisweagent.models.test_models import DeterministicModel  # noqa: E402
 
 
 class FakeBackend(DummyBackend):
-    """Returns predetermined raw strings and parses them like a real backend, recording each prompt's history."""
+    """Returns predetermined raw strings and parses them like a real backend, recording each generation's action."""
 
     def __init__(self, responses: list[str]):
         super().__init__(responses)
-        self.histories: list[str] = []
+        self.actions: list = []
+
+    @property
+    def histories(self) -> list[str]:
+        """The `history` argument of every `next_action` generation."""
+        return [a._arguments.value for a in self.actions if isinstance(a, GenerativeStub)]
 
     async def _generate_from_context(self, action, ctx, *, format=None, model_options=None, tool_calls=False):
-        self.histories.append(action._arguments.value)
+        self.actions.append(action)
         mot = ModelOutputThunk(value=self.responses[self.idx])
         self.idx += 1
         mot._generate_log = GenerateLog()
@@ -42,10 +47,11 @@ def mellea_config():
 
 
 def make_agent(responses: list[str], config: dict, **kwargs) -> tuple[MelleaAgent, FakeBackend]:
-    """`get_agent` deep-copies the config, so the backend must be taken from the agent's session."""
-    config = {**config, **kwargs, "session": MelleaSession(FakeBackend(responses))}
-    agent = get_agent(DeterministicModel(outputs=[]), LocalEnvironment(), config)
-    return agent, agent.session.backend
+    """`get_agent` deep-copies the config, so the backend must be taken from the agent."""
+    agent = get_agent(
+        DeterministicModel(outputs=[]), LocalEnvironment(), {**config, **kwargs, "backend": FakeBackend(responses)}
+    )
+    return agent, agent.backend
 
 
 def test_bash_decision_reaches_environment(mellea_config, tmp_path):
@@ -77,7 +83,7 @@ def test_finish_does_not_execute_command(mellea_config, tmp_path):
         (json.dumps({"result": {"thought": "t", "action": "run", "command": "touch {marker}"}}), "literal_error"),
         ('{"result": {"thought": "t", "action": "bash", "command": "touch {marker}"', "json_invalid"),
         ("touch {marker}", "json_invalid"),
-        (decision("bash", "   "), 'Action "bash" requires a non-empty command.'),
+        (decision("bash", "   "), 'A decision with action "bash" must have a non-empty command.'),
     ],
 )
 def test_invalid_decision_does_not_reach_environment(mellea_config, tmp_path, invalid_response, expected_error):
@@ -103,3 +109,39 @@ def test_step_limit(mellea_config):
     assert agent.run("task")["exit_status"] == "LimitsExceeded"
     assert agent.n_calls == 1
     assert agent.serialize()["info"]["config"]["agent_type"] == "minisweagent.agents.mellea.MelleaAgent"
+
+
+def test_failed_requirement_is_repaired_before_execution(mellea_config, tmp_path):
+    agent, backend = make_agent(
+        [decision("bash", ""), decision("bash", f"touch {tmp_path}/marker"), decision("finish")],
+        mellea_config,
+        loop_budget=2,
+    )
+    assert agent.run("task")["exit_status"] == "Submitted"
+    assert (tmp_path / "marker").exists()
+    assert agent.n_calls == 2
+    assert not any(m.get("extra", {}).get("interrupt_type") == "FormatError" for m in agent.messages)
+    assert agent.messages[2]["extra"]["actions"] == [{"command": f"touch {tmp_path}/marker"}]
+    assert "must have a non-empty command" in backend.actions[1].content
+
+
+def test_exhausted_loop_budget_does_not_reach_environment(mellea_config):
+    agent, _ = make_agent(
+        [decision("bash", ""), decision("bash", " "), decision("finish")], mellea_config, loop_budget=2
+    )
+    assert agent.run("task")["exit_status"] == "Submitted"
+    assert agent.n_calls == 2
+    assert [m["role"] for m in agent.messages] == ["system", "user", "assistant", "user", "assistant", "exit"]
+    assert "must have a non-empty command" in agent.messages[3]["content"]
+
+
+def test_semantic_requirement_blocks_finish(mellea_config):
+    requirement = "Only finish once the task has been implemented and verified."
+    agent, backend = make_agent(
+        [decision("finish"), "no", decision("finish"), "yes"], mellea_config, requirements=[requirement]
+    )
+    assert agent.run("task")["exit_status"] == "Submitted"
+    assert agent.n_calls == 2
+    assert requirement in agent.messages[3]["content"]
+    assert requirement in backend.histories[1]
+    assert [type(a).__name__ for a in backend.actions] == ["SyncGenerativeStub", "Requirement"] * 2
