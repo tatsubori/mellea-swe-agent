@@ -94,6 +94,14 @@ def test_litellm_toolcall_explicit():
 
 
 @requires_openai
+def test_mellea_agent():
+    """Test the MelleaAgent (requires `mini-swe-agent[mellea]`)."""
+    pytest.importorskip("mellea")
+    result = run_mini_command(["--model", "openai/gpt-5-mini", "-c", "mellea"])
+    assert result.returncode == 0
+
+
+@requires_openai
 def test_litellm_response_toolcall():
     """Test with litellm_response_toolcall model class (OpenAI Responses API)."""
     result = run_mini_command(["--model", "openai/gpt-5.2", "--model-class", "litellm_response"])

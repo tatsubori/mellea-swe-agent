@@ -2,9 +2,12 @@
 See MELLEA_MINI_SWE_AGENT_PROTOTYPE.md for the motivation. Requires `pip install mini-swe-agent[mellea]`.
 """
 
+import os
 import time
+from collections import Counter
 from typing import Literal
 
+import litellm
 from jinja2 import StrictUndefined, Template
 from mellea import ChatContext, Requirement, SamplingResult, ValidationResult, generative, start_backend
 from mellea.core import Backend, ComponentParseError, Context
@@ -14,6 +17,7 @@ from pydantic import BaseModel
 from minisweagent import Environment, Model
 from minisweagent.agents.default import AgentConfig, DefaultAgent
 from minisweagent.exceptions import FormatError, Submitted
+from minisweagent.models import GLOBAL_MODEL_STATS
 from minisweagent.models.utils.actions_text import format_observation_messages
 
 
@@ -64,6 +68,8 @@ class MelleaAgentConfig(AgentConfig):
     """Semantic requirements that every decision is checked against by the LM (LLM-as-a-judge)."""
     loop_budget: int = 1
     """Maximum generation attempts per decision. Failed attempts are repaired with the failed requirements."""
+    cost_tracking: Literal["default", "ignore_errors"] = os.getenv("MSWEA_COST_TRACKING", "default")
+    """Whether to raise if litellm cannot calculate the cost of the Mellea model."""
     observation_template: str = (
         "{% if output.exception_info %}<exception>{{output.exception_info}}</exception>\n{% endif %}"
         "<returncode>{{output.returncode}}</returncode>\n<output>\n{{output.output}}</output>"
@@ -85,13 +91,13 @@ class MelleaAgent(DefaultAgent):
     ):
         """`model` is only used for message formatting and serialization, all decisions go through `backend`."""
         super().__init__(model, env, config_class=config_class, **kwargs)
+        self.model_id = self.config.mellea_model_id or model.config.model_name
+        self.n_parse_errors = 0
         self.backend = (
             backend
-            or start_backend(
-                self.config.mellea_backend,
-                self.config.mellea_model_id or model.config.model_name,
-                model_options=self.config.mellea_model_options,
-            )[1]
+            or start_backend(self.config.mellea_backend, self.model_id, model_options=self.config.mellea_model_options)[
+                1
+            ]
         )
 
     def _format_error(self, error: str) -> FormatError:
@@ -111,16 +117,27 @@ class MelleaAgent(DefaultAgent):
                 history=render_history(self.messages),
             )
         except ComponentParseError as e:
+            self.n_parse_errors += 1
             raise self._format_error(str(e))
+        diagnostics = self._diagnostics(strategy.result)
+        cost = self._cost(diagnostics["prompt_tokens"], diagnostics["completion_tokens"])
+        self.cost += cost
+        GLOBAL_MODEL_STATS.add(cost)
         actions = [{"command": decision.command}] if decision.action == "bash" else []
         message = self.model.format_message(
             role="assistant",
             content=decision.model_dump_json(),
-            extra={"decision": decision.model_dump(), "actions": actions, "timestamp": time.time()},
+            extra={
+                "decision": decision.model_dump(),
+                "actions": actions,
+                "cost": cost,
+                "mellea": diagnostics,
+                "timestamp": time.time(),
+            },
         )
         self.add_messages(message)
-        if not strategy.result.success:
-            failed = [r.description for r, v in strategy.result.sample_validations[-1] if not v]
+        if not diagnostics["success"]:
+            failed = diagnostics["attempts"][-1]["failed_requirements"]
             raise self._format_error(
                 "The decision violates these requirements:\n" + "\n".join(f"* {f}" for f in failed)
             )
@@ -129,6 +146,51 @@ class MelleaAgent(DefaultAgent):
                 {"role": "exit", "content": decision.thought, "extra": {"exit_status": "Submitted", "submission": ""}}
             )
         return message
+
+    @staticmethod
+    def _diagnostics(result: SamplingResult) -> dict:
+        """Every attempt with its failed requirements, plus token usage of all generations and LM judgements."""
+        thunks = [*result.sample_generations, *(v.thunk for vs in result.sample_validations for _, v in vs if v.thunk)]
+        usages = [t.generation.usage for t in thunks if t.generation.usage]
+        return {
+            "success": result.success,
+            "attempts": [
+                {"decision": g.parsed_repr.model_dump(), "failed_requirements": [r.description for r, v in vs if not v]}
+                for g, vs in zip(result.sample_generations, result.sample_validations)
+            ],
+            "lm_calls": len(thunks),
+            "prompt_tokens": sum(u["prompt_tokens"] for u in usages),
+            "completion_tokens": sum(u["completion_tokens"] for u in usages),
+        }
+
+    def _cost(self, prompt_tokens: int, completion_tokens: int) -> float:
+        if not prompt_tokens + completion_tokens:
+            return 0.0
+        try:
+            return sum(
+                litellm.cost_per_token(
+                    model=self.model_id, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens
+                )
+            )
+        except Exception as e:
+            if self.config.cost_tracking == "ignore_errors":
+                return 0.0
+            msg = f"Cannot calculate cost for {self.model_id}: {e}. Set agent.cost_tracking or MSWEA_COST_TRACKING to 'ignore_errors'."
+            raise RuntimeError(msg) from e
+
+    def serialize(self, *extra_dicts) -> dict:
+        stats = [m["extra"]["mellea"] for m in self.messages if "mellea" in m.get("extra", {})]
+        summary = {
+            "decisions": len(stats),
+            "attempts": sum(len(s["attempts"]) for s in stats),
+            "lm_calls": sum(s["lm_calls"] for s in stats),
+            "rejected_decisions": sum(not s["success"] for s in stats),
+            "parse_errors": self.n_parse_errors,
+            "requirement_failures": dict(
+                Counter(f for s in stats for a in s["attempts"] for f in a["failed_requirements"])
+            ),
+        }
+        return super().serialize({"info": {"mellea_stats": summary}}, *extra_dicts)
 
     def execute_actions(self, message: dict) -> list[dict]:
         outputs = [self.env.execute(action) for action in message["extra"]["actions"]]
