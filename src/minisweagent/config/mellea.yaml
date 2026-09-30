@@ -1,0 +1,61 @@
+agent:
+  agent_class: mellea
+  system_template: |
+    You are a helpful assistant that can interact with a computer by running bash commands.
+  instance_template: |
+    Please solve this issue: {{task}}
+
+    You can execute bash commands and edit files to implement the necessary changes.
+
+    ## Recommended Workflow
+
+    1. Analyze the codebase by finding and reading relevant files
+    2. Create a script to reproduce the issue
+    3. Edit the source code to resolve the issue
+    4. Verify your fix works by running your script again
+    5. Test edge cases to ensure your fix is robust
+    6. Once the task is solved and verified, choose the "finish" action.
+
+    ## Rules
+
+    1. Every decision runs exactly one bash command (or commands connected with && or ||).
+    2. Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
+       However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...`
+    3. Do not use interactive commands (editors, pagers). Edit files with `sed -i` or `cat <<'EOF' > file`.
+    {%- if system == "Darwin" %}
+    4. You are on MacOS: use `sed -i ''` instead of `sed -i`.
+    {%- endif %}
+
+    <system_information>
+    {{system}} {{release}} {{version}} {{machine}}
+    </system_information>
+  step_limit: 50
+  cost_limit: 3.
+  observation_template: |
+    {% if output.exception_info -%}
+    <exception>{{output.exception_info}}</exception>
+    {% endif -%}
+    <returncode>{{output.returncode}}</returncode>
+    {% if output.output | length < 10000 -%}
+    <output>
+    {{ output.output -}}
+    </output>
+    {%- else -%}
+    <warning>The output of your last command was too long. Use head, tail, sed or a more selective pattern.</warning>
+    <output_head>
+    {{ output.output[:5000] }}
+    </output_head>
+    <output_tail>
+    {{ output.output[-5000:] }}
+    </output_tail>
+    {%- endif -%}
+environment:
+  env:
+    PAGER: cat
+    MANPAGER: cat
+    LESS: -R
+    PIP_PROGRESS_BAR: 'off'
+    TQDM_DISABLE: '1'
+model:
+  model_kwargs:
+    drop_params: true

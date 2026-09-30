@@ -129,6 +129,15 @@ class DefaultAgent:
 
     def query(self) -> dict:
         """Query the model and return model messages. Override to add hooks."""
+        self.check_limits()
+        self.n_calls += 1
+        message = self.model.query(self.messages)
+        self.cost += message.get("extra", {}).get("cost", 0.0)
+        self.add_messages(message)
+        return message
+
+    def check_limits(self) -> None:
+        """Raise LimitsExceeded or TimeExceeded if the step, cost, or wall-clock limit is reached."""
         if 0 < self.config.step_limit <= self.n_calls or 0 < self.config.cost_limit <= self.cost:
             raise LimitsExceeded(
                 {
@@ -145,11 +154,6 @@ class DefaultAgent:
                     "extra": {"exit_status": "TimeExceeded", "submission": ""},
                 }
             )
-        self.n_calls += 1
-        message = self.model.query(self.messages)
-        self.cost += message.get("extra", {}).get("cost", 0.0)
-        self.add_messages(message)
-        return message
 
     def execute_actions(self, message: dict) -> list[dict]:
         """Execute actions in message, add observation messages, return them."""
