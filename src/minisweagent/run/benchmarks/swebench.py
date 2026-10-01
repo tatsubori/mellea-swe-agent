@@ -21,7 +21,7 @@ from minisweagent.config import builtin_config_dir, get_config_from_spec
 from minisweagent.environments import get_environment
 from minisweagent.models import get_model
 from minisweagent.run.benchmarks.utils.batch_progress import RunBatchProgressManager
-from minisweagent.run.benchmarks.utils.common import ProgressTrackingAgent
+from minisweagent.run.benchmarks.utils.common import get_progress_tracking_agent_class
 from minisweagent.utils.log import add_file_handler, logger
 from minisweagent.utils.serialize import UNSET, recursive_merge
 
@@ -144,12 +144,13 @@ def process_instance(
 
     try:
         env = get_sb_environment(config, instance)
-        agent = ProgressTrackingAgent(
+        agent_config = dict(config.get("agent", {}))
+        agent = get_progress_tracking_agent_class(agent_config.pop("agent_class", "default"))(
             model,
             env,
             progress_manager=progress_manager,
             instance_id=instance_id,
-            **config.get("agent", {}),
+            **agent_config,
         )
         info = agent.run(task)
         exit_status = info.get("exit_status")
