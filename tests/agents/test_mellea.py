@@ -13,9 +13,16 @@ from mellea.core import GenerateLog, ModelOutputThunk  # noqa: E402
 from mellea.stdlib.components.genstub import GenerativeStub  # noqa: E402
 
 from minisweagent.agents import get_agent  # noqa: E402
+from minisweagent.agents.default import DefaultAgent  # noqa: E402
 from minisweagent.agents.mellea import MelleaAgent  # noqa: E402
 from minisweagent.environments.local import LocalEnvironment  # noqa: E402
 from minisweagent.models.test_models import DeterministicModel  # noqa: E402
+from minisweagent.run.benchmarks.utils.batch_progress import RunBatchProgressManager  # noqa: E402
+from minisweagent.run.benchmarks.utils.common import (  # noqa: E402
+    ProgressTrackingAgent,
+    get_progress_tracking_agent_class,
+)
+from minisweagent.utils.serialize import recursive_merge  # noqa: E402
 
 
 class FakeBackend(DummyBackend):
@@ -50,13 +57,23 @@ def mellea_config():
     return yaml.safe_load(Path("src/minisweagent/config/mellea.yaml").read_text())["agent"]
 
 
+@pytest.fixture
+def swebench_mellea_config():
+    """swebench.yaml with the swebench_mellea.yaml overlay, as with `-c swebench.yaml -c swebench_mellea.yaml`."""
+    configs = [
+        yaml.safe_load(Path(f"src/minisweagent/config/benchmarks/{n}.yaml").read_text())
+        for n in ("swebench", "swebench_mellea")
+    ]
+    return recursive_merge(*configs)
+
+
 def make_agent(
-    responses: list[str], config: dict, usage: dict | None = None, **kwargs
+    responses: list[str], config: dict, usage: dict | None = None, env: LocalEnvironment | None = None, **kwargs
 ) -> tuple[MelleaAgent, FakeBackend]:
     """`get_agent` deep-copies the config, so the backend must be taken from the agent."""
     agent = get_agent(
         DeterministicModel(outputs=[]),
-        LocalEnvironment(),
+        env or LocalEnvironment(),
         {**config, **kwargs, "backend": FakeBackend(responses, usage)},
     )
     return agent, agent.backend
@@ -234,3 +251,77 @@ def test_smoke_edit_and_test_repository(mellea_config, tmp_path):
     assert (tmp_path / "hello.py").read_text() == 'def hello():\n    return "hello world"\n'
     assert "1 passed" in agent.messages[7]["content"]
     assert json.loads((tmp_path / "traj.json").read_text())["info"]["mellea_stats"]["decisions"] == 4
+
+
+def test_finish_command_submits_through_environment(mellea_config, tmp_path):
+    agent, backend = make_agent(
+        [
+            decision("finish", f"touch {tmp_path}/marker"),
+            decision("bash", f"printf 'the patch\\n' > {tmp_path}/patch.txt"),
+            decision("finish"),
+        ],
+        mellea_config,
+        finish_command=f"echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat {tmp_path}/patch.txt",
+    )
+    assert agent.run("task") == {"exit_status": "Submitted", "submission": "the patch\n"}
+    assert not (tmp_path / "marker").exists()
+    assert agent.n_calls == 3
+    assert [m["role"] for m in agent.messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "exit",
+    ]
+    assert "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" in agent.messages[3]["content"]
+    assert "No such file" in agent.messages[3]["content"] and "No such file" in backend.histories[1]
+
+
+def test_swebench_overlay_keeps_baseline_templates_and_submits_patch(swebench_mellea_config, tmp_path):
+    baseline = yaml.safe_load(Path("src/minisweagent/config/benchmarks/swebench.yaml").read_text())["agent"]
+    config = swebench_mellea_config["agent"]
+    assert (config["system_template"], config["instance_template"]) == (
+        baseline["system_template"],
+        baseline["instance_template"],
+    )
+    assert config["observation_template"] == swebench_mellea_config["model"]["observation_template"]
+    agent, _ = make_agent(
+        [
+            decision("bash", "python3 -c 'print(\"x\" * 20000)'"),
+            "garbage",
+            decision("bash", "printf 'diff\\n' > patch.txt"),
+            decision("finish"),
+        ],
+        config,
+        env=LocalEnvironment(cwd=str(tmp_path)),
+    )
+    assert agent.run("Fix the bug")["submission"] == "diff\n"
+    assert "10001 characters elided" in agent.messages[3]["content"]
+    assert len(agent.messages[3]["content"]) < 12000
+    assert "consult the first message about" in agent.messages[4]["content"]
+
+
+@pytest.mark.parametrize(("spec", "agent_class"), [("default", DefaultAgent), ("mellea", MelleaAgent)])
+def test_progress_tracking_agent_class(spec, agent_class):
+    cls = get_progress_tracking_agent_class(spec)
+    assert issubclass(cls, ProgressTrackingAgent) and issubclass(cls, agent_class)
+
+
+def test_progress_tracking_mellea_agent_reports_steps(swebench_mellea_config, tmp_path):
+    progress_manager = RunBatchProgressManager(1)
+    progress_manager.on_instance_start("inst")
+    config = {k: v for k, v in swebench_mellea_config["agent"].items() if k != "agent_class"} | {"step_limit": 2}
+    agent = get_progress_tracking_agent_class("mellea")(
+        DeterministicModel(outputs=[]),
+        LocalEnvironment(cwd=str(tmp_path)),
+        progress_manager=progress_manager,
+        instance_id="inst",
+        backend=FakeBackend([decision("bash", "echo hi"), decision("bash", "echo hi")]),
+        **config,
+    )
+    assert agent.run("task")["exit_status"] == "LimitsExceeded"
+    assert agent.n_calls == 2
+    assert progress_manager._task_progress_bar.tasks[0].fields["status"].strip() == "Step   3 ($0.00)"

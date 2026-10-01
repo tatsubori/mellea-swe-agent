@@ -89,6 +89,10 @@ class MelleaAgentConfig(AgentConfig):
     """Template used to render the observation after executing an action."""
     format_error_template: str = "Your previous decision was invalid:\n\n{{error}}\n\nPlease decide again."
     """Template used when a decision cannot be parsed or violates requirements."""
+    finish_command: str = ""
+    """Bash command that a "finish" decision runs instead of submitting an empty submission. The environment
+    submits its output if it prints `COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` first and exits 0, like a bash submission.
+    Otherwise the observation is shown and the agent continues."""
 
 
 class MelleaAgent(DefaultAgent):
@@ -106,7 +110,12 @@ class MelleaAgent(DefaultAgent):
         self.model_id = self.config.mellea_model_id or model.config.model_name
         self.n_parse_errors = 0
         # Mellea's litellm backend always sets drop_params itself and rejects a second value.
-        model_kwargs = {k: v for k, v in getattr(model.config, "model_kwargs", {}).items() if k != "drop_params"}
+        # `next_action` sends no tools, and OpenAI rejects parallel_tool_calls without tools.
+        model_kwargs = {
+            k: v
+            for k, v in getattr(model.config, "model_kwargs", {}).items()
+            if k not in ("drop_params", "parallel_tool_calls")
+        }
         self.backend = (
             backend
             or start_backend(
@@ -139,7 +148,8 @@ class MelleaAgent(DefaultAgent):
         cost = self._cost(diagnostics["prompt_tokens"], diagnostics["completion_tokens"])
         self.cost += cost
         GLOBAL_MODEL_STATS.add(cost)
-        actions = [{"command": decision.command}] if decision.action == "bash" else []
+        command = decision.command if decision.action == "bash" else self.config.finish_command
+        actions = [{"command": command}] if command else []
         message = self.model.format_message(
             role="assistant",
             content=decision.model_dump_json(),
@@ -157,7 +167,7 @@ class MelleaAgent(DefaultAgent):
             raise self._format_error(
                 "The decision violates these requirements:\n" + "\n".join(f"* {f}" for f in failed)
             )
-        if decision.action == "finish":
+        if decision.action == "finish" and not actions:
             raise Submitted(
                 {"role": "exit", "content": decision.thought, "extra": {"exit_status": "Submitted", "submission": ""}}
             )
