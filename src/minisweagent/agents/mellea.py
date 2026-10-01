@@ -11,8 +11,9 @@ import litellm
 from jinja2 import StrictUndefined, Template
 from mellea import ChatContext, Requirement, SamplingResult, ValidationResult, generative, start_backend
 from mellea.core import Backend, ComponentParseError, Context
+from mellea.stdlib.components.genstub import FunctionResponse
 from mellea.stdlib.sampling.base import MultiTurnStrategy
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from minisweagent import Environment, Model
 from minisweagent.agents.default import AgentConfig, DefaultAgent
@@ -22,9 +23,10 @@ from minisweagent.models.utils.actions_text import format_observation_messages
 
 
 class Decision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     thought: str
     action: Literal["bash", "finish"]
-    command: str = ""
+    command: str
 
 
 @generative
@@ -35,6 +37,16 @@ def next_action(history: str) -> Decision:
     Either run exactly one bash command that makes progress on the task (action="bash"),
     or finish (action="finish", empty command) once the task has been solved and verified.
     """
+
+
+class NextActionResponse(FunctionResponse[Decision]):
+    model_config = ConfigDict(extra="forbid")
+    result: Decision
+
+
+# Mellea sends its response model as a `strict` JSON schema, which e.g. Azure OpenAI rejects unless every object
+# forbids additional properties and no `$ref` has sibling keywords. Mellea's generated wrapper violates both.
+next_action._response_model = NextActionResponse
 
 
 def render_history(messages: list[dict]) -> str:
@@ -63,7 +75,7 @@ class MelleaAgentConfig(AgentConfig):
     mellea_model_id: str = ""
     """Model id for the Mellea backend. Defaults to the `model_name` of the mini-swe-agent model."""
     mellea_model_options: dict = {}
-    """Model options passed to `mellea.start_backend`."""
+    """Model options passed to `mellea.start_backend`, on top of the mini-swe-agent model's `model_kwargs`."""
     requirements: list[str] = []
     """Semantic requirements that every decision is checked against by the LM (LLM-as-a-judge)."""
     loop_budget: int = 1
@@ -93,11 +105,15 @@ class MelleaAgent(DefaultAgent):
         super().__init__(model, env, config_class=config_class, **kwargs)
         self.model_id = self.config.mellea_model_id or model.config.model_name
         self.n_parse_errors = 0
+        # Mellea's litellm backend always sets drop_params itself and rejects a second value.
+        model_kwargs = {k: v for k, v in getattr(model.config, "model_kwargs", {}).items() if k != "drop_params"}
         self.backend = (
             backend
-            or start_backend(self.config.mellea_backend, self.model_id, model_options=self.config.mellea_model_options)[
-                1
-            ]
+            or start_backend(
+                self.config.mellea_backend,
+                self.model_id,
+                model_options=model_kwargs | self.config.mellea_model_options,
+            )[1]
         )
 
     def _format_error(self, error: str) -> FormatError:
